@@ -282,22 +282,45 @@ async function scanLikedSongs() {
   els.scanBtn.disabled = true;
   els.createBtn.disabled = true;
   els.icebergBtn.disabled = true;
-  els.downloadIceberg.classList.add("hidden");
-  els.icebergCanvas.classList.add("hidden");
 
-  const liked = await getAllLikedTracks();
-  const artistMap = await getArtistMap(liked);
+  try {
+    const liked = await getAllLikedTracks();
 
-  scoredTracks = liked.map(track => scoreTrack(track, artistMap));
-  generatedTiers = buildTiers();
+    scoredTracks = liked.map(track => {
+      const trackPopularity = track.popularity ?? 0;
 
-  renderPreview();
+      return {
+        id: track.id,
+        uri: track.uri,
+        name: track.name,
+        artist: track.artists.map(a => a.name).join(", "),
+        album: track.album?.name || "",
+        trackPopularity,
+        artistPopularity: null,
+        followers: null,
 
-  const hasTiers = generatedTiers.length > 0;
-  els.createBtn.disabled = !hasTiers;
-  els.icebergBtn.disabled = !hasTiers;
-  els.scanBtn.disabled = false;
-  setStatus(`Done. Found ${scoredTracks.length} liked songs and ${generatedTiers.length} usable tiers.`);
+        // 0 = obscure, 100 = basic
+        basicnessScore: trackPopularity,
+
+        spotifyUrl: track.external_urls?.spotify || ""
+      };
+    });
+
+    generatedTiers = buildTiers(scoredTracks);
+    renderPreview();
+
+    els.createBtn.disabled = generatedTiers.length === 0;
+    els.icebergBtn.disabled = generatedTiers.length === 0;
+
+    setStatus(
+      `Done. Scored ${scoredTracks.length} liked songs using Spotify track popularity only. ` +
+      `Generated ${generatedTiers.length} tiers.`
+    );
+  } catch (err) {
+    setStatus(err.message);
+  } finally {
+    els.scanBtn.disabled = false;
+  }
 }
 
 async function addTracksToPlaylist(playlistId, uris) {
