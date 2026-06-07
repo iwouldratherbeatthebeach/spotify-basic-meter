@@ -235,20 +235,40 @@ function getTierNames(count) {
   return names.slice(0, count);
 }
 
-function buildTiers() {
+function buildTiers(scored) {
   const count = Number(els.tierCount.value);
   const tracksPerPlaylist = Number(els.tracksPerPlaylist.value);
   const minTracks = Number(els.minTracksPerTier.value);
-  const names = getTierNames(count);
-  const sorted = [...scoredTracks].sort((a, b) => a.basicnessScore - b.basicnessScore);
+  const names = getPlaylistNames(count);
+
+  const sorted = [...scored].sort((a, b) => {
+    if (a.basicnessScore !== b.basicnessScore) {
+      return a.basicnessScore - b.basicnessScore;
+    }
+    return a.name.localeCompare(b.name);
+  });
+
   const tiers = [];
 
   for (let i = 0; i < count; i++) {
-    const minScore = Math.floor((100 / count) * i);
-    const maxScore = i === count - 1 ? 100 : Math.floor((100 / count) * (i + 1)) - 1;
-    const tracks = sorted.filter(t => t.basicnessScore >= minScore && t.basicnessScore <= maxScore).slice(0, tracksPerPlaylist);
-    if (tracks.length >= minTracks) tiers.push({ name: names[i], minScore, maxScore, tracks });
+    const start = Math.floor((sorted.length / count) * i);
+    const end = Math.floor((sorted.length / count) * (i + 1));
+    const bucket = sorted.slice(start, end);
+
+    if (bucket.length >= minTracks) {
+      tiers.push({
+        name: names[i],
+        minScore: bucket[0]?.basicnessScore ?? 0,
+        maxScore: bucket[bucket.length - 1]?.basicnessScore ?? 0,
+        percentileStart: Math.round((i / count) * 100),
+        percentileEnd: Math.round(((i + 1) / count) * 100),
+        tracks: bucket.slice(0, tracksPerPlaylist)
+      });
+    }
   }
+
+  return tiers;
+}
 
   return tiers;
 }
