@@ -81,7 +81,7 @@ async function handleOAuthCallback() {
   const verifier = localStorage.getItem("spotify_code_verifier");
 
   if (!verifier) {
-    throw new Error("Missing Spotify login verifier. Clear login and try again.");
+    throw new Error("Missing Spotify login verifier. Log out and try again.");
   }
 
   setStatus("Finishing Spotify login...");
@@ -169,24 +169,21 @@ function normalizeText(value) {
     .trim();
 }
 
-function trackKeyFromParts(artist, name) {
-  return `${normalizeText(artist)}::${normalizeText(name)}`;
+function trackIdentity(item) {
+  return `${normalizeText(item.artist)}::${normalizeText(item.name)}`;
 }
 
-function trackKey(track) {
+function artistKeyFromTrack(track) {
+  return normalizeText(track.artists?.[0]?.name || "");
+}
+
+function albumKeyFromTrack(track) {
+  return normalizeText(track.album?.name || "");
+}
+
+function trackKeyFromTrack(track) {
   const artist = track.artists?.[0]?.name || "";
-  return trackKeyFromParts(artist, track.name);
-}
-
-function stableHashToScore(text) {
-  let hash = 2166136261;
-
-  for (let i = 0; i < text.length; i++) {
-    hash ^= text.charCodeAt(i);
-    hash = Math.imul(hash, 16777619);
-  }
-
-  return Math.abs(hash >>> 0) % 100;
+  return `${normalizeText(artist)}::${normalizeText(track.name)}`;
 }
 
 async function getAllLikedTracks() {
@@ -204,49 +201,27 @@ async function getAllLikedTracks() {
       : null;
   }
 
-  return items
-    .map(item => ({
+  const deduped = [];
+  const seen = new Set();
+
+  for (const item of items) {
+    const track = item.track;
+
+    if (!track || track.type !== "track" || !track.id) continue;
+
+    const identity = trackKeyFromTrack(track);
+
+    if (seen.has(identity)) continue;
+
+    seen.add(identity);
+
+    deduped.push({
       addedAt: item.added_at,
-      track: item.track
-    }))
-    .filter(item => item.track && item.track.type === "track" && item.track.id);
-}
-
-async function hydrateTracks(likedItems) {
-  const ids = likedItems.map(item => item.track.id).filter(Boolean);
-  const idChunks = chunk(ids, 50);
-  const hydratedMap = new Map();
-
-  for (let i = 0; i < idChunks.length; i++) {
-    const idList = idChunks[i].join(",");
-
-    try {
-      const data = await spotifyFetch(`/tracks?ids=${idList}&market=from_token`);
-
-      for (const track of data.tracks || []) {
-        if (track && track.id) {
-          hydratedMap.set(track.id, track);
-        }
-      }
-
-      setStatus(`Hydrated track metadata ${i + 1}/${idChunks.length}...`);
-    } catch (err) {
-      console.warn("Track hydration failed:", err);
-      setStatus(
-        `Track metadata hydration failed. Continuing with saved-track data. ${err.message}`
-      );
-      break;
-    }
+      track
+    });
   }
 
-  return likedItems.map(item => {
-    const hydrated = hydratedMap.get(item.track.id);
-
-    return {
-      addedAt: item.addedAt,
-      track: hydrated || item.track
-    };
-  });
+  return deduped;
 }
 
 async function getUserTopTrackScores() {
@@ -256,8 +231,7 @@ async function getUserTopTrackScores() {
     { key: "long_term", weight: 50 }
   ];
 
-  const scoreById = new Map();
-  const scoreByKey = new Map();
+  const scoreByTrackKey = new Map();
 
   for (const range of ranges) {
     try {
@@ -266,12 +240,11 @@ async function getUserTopTrackScores() {
       );
 
       data.items.forEach((track, index) => {
+        const key = trackKeyFromTrack(track);
         const rankScore = Math.max(range.weight - index, 1);
-        const idExisting = scoreById.get(track.id) || 0;
-        const keyExisting = scoreByKey.get(trackKey(track)) || 0;
+        const existing = scoreByTrackKey.get(key) || 0;
 
-        scoreById.set(track.id, idExisting + rankScore);
-        scoreByKey.set(trackKey(track), keyExisting + rankScore);
+        scoreByTrackKey.set(key, existing + rankScore);
       });
 
       setStatus(`Fetched your ${range.key.replace("_", " ")} top tracks...`);
@@ -281,12 +254,11 @@ async function getUserTopTrackScores() {
     }
   }
 
-  return { scoreById, scoreByKey };
+  return scoreByTrackKey;
 }
 
 async function getRecentlyPlayedScores() {
-  const scoreById = new Map();
-  const scoreByKey = new Map();
+  const scoreByTrackKey = new Map();
 
   try {
     const data = await spotifyFetch("/me/player/recently-played?limit=50");
@@ -295,12 +267,11 @@ async function getRecentlyPlayedScores() {
       const track = item.track;
       if (!track || !track.id) return;
 
+      const key = trackKeyFromTrack(track);
       const score = Math.max(60 - index, 1);
-      const idExisting = scoreById.get(track.id) || 0;
-      const keyExisting = scoreByKey.get(trackKey(track)) || 0;
+      const existing = scoreByTrackKey.get(key) || 0;
 
-      scoreById.set(track.id, idExisting + score);
-      scoreByKey.set(trackKey(track), keyExisting + score);
+      scoreByTrackKey.set(key, existing + score);
     });
 
     setStatus("Fetched your recently played tracks...");
@@ -309,101 +280,117 @@ async function getRecentlyPlayedScores() {
     setStatus("Could not fetch recently played tracks. Continuing...");
   }
 
-  return { scoreById, scoreByKey };
+  return scoreByTrackKey;
 }
 
-function mergeActivityScore(track, topScores, recentScores) {
-  const key = trackKey(track);
-
-  const topById = topScores.scoreById.get(track.id) || 0;
-  const topByKey = topScores.scoreByKey.get(key) || 0;
-
-  const recentById = recentScores.scoreById.get(track.id) || 0;
-  const recentByKey = recentScores.scoreByKey.get(key) || 0;
-
-  return Math.max(topById, topByKey) + Math.max(recentById, recentByKey);
+function percentileRank(value, min, max) {
+  if (max <= min) return 50;
+  return Math.round(((value - min) / (max - min)) * 100);
 }
 
-function getRealPopularityStatus(scored) {
-  const nonZero = scored.filter(t => t.trackPopularity > 0).length;
-  const percentNonZero = scored.length ? nonZero / scored.length : 0;
+function buildFrequencyMaps(likedItems) {
+  const artistCounts = new Map();
+  const albumCounts = new Map();
 
-  return {
-    nonZero,
-    percentNonZero,
-    popularityAvailable: percentNonZero > 0.05
-  };
+  for (const item of likedItems) {
+    const artistKey = artistKeyFromTrack(item.track);
+    const albumKey = albumKeyFromTrack(item.track);
+
+    artistCounts.set(artistKey, (artistCounts.get(artistKey) || 0) + 1);
+
+    if (albumKey) {
+      albumCounts.set(albumKey, (albumCounts.get(albumKey) || 0) + 1);
+    }
+  }
+
+  return { artistCounts, albumCounts };
 }
 
 function buildScoredTracks(likedItems, topScores, recentScores) {
-  const raw = likedItems.map(item => {
+  const { artistCounts, albumCounts } = buildFrequencyMaps(likedItems);
+
+  const addedTimes = likedItems
+    .map(item => new Date(item.addedAt).getTime())
+    .filter(Number.isFinite);
+
+  const oldest = Math.min(...addedTimes);
+  const newest = Math.max(...addedTimes);
+
+  const artistCountValues = [...artistCounts.values()];
+  const albumCountValues = [...albumCounts.values()];
+
+  const maxArtistCount = Math.max(...artistCountValues, 1);
+  const maxAlbumCount = Math.max(...albumCountValues, 1);
+
+  return likedItems.map(item => {
     const track = item.track;
-    const primaryArtist = track.artists?.[0]?.name || "";
-    const fullArtist = track.artists?.map(a => a.name).join(", ") || "";
 
-    const trackPopularity =
-      typeof track.popularity === "number"
-        ? track.popularity
-        : 0;
+    const artist = track.artists?.map(a => a.name).join(", ") || "";
+    const primaryArtistKey = artistKeyFromTrack(track);
+    const albumKey = albumKeyFromTrack(track);
+    const key = trackKeyFromTrack(track);
 
-    const activityScore = mergeActivityScore(track, topScores, recentScores);
+    const artistCount = artistCounts.get(primaryArtistKey) || 1;
+    const albumCount = albumCounts.get(albumKey) || 1;
+
+    const addedTime = new Date(item.addedAt).getTime();
+
+    /*
+      Newer saved songs feel more surface-level.
+      Older saved songs feel deeper in your personal library.
+    */
+    const recencyScore = percentileRank(addedTime, oldest, newest);
+
+    /*
+      Artists/albums that appear many times in your liked songs are more
+      familiar/basic within YOUR library. One-off artists are deeper cuts.
+    */
+    const artistFamiliarity = Math.round((artistCount / maxArtistCount) * 100);
+    const albumFamiliarity = Math.round((albumCount / maxAlbumCount) * 100);
+
+    /*
+      Top/recent activity is a surface-level signal. It should influence the
+      ranking, but not dominate the whole app.
+    */
+    const topScore = topScores.get(key) || 0;
+    const recentScore = recentScores.get(key) || 0;
+    const activityRaw = topScore + recentScore;
+    const activityScore = Math.min(100, Math.round(activityRaw / 3));
+
+    /*
+      Final score:
+      0 = deep personal-library cut
+      100 = surface-level / basic within user's own listening world
+    */
+    const libraryBasicnessScore = Math.round(
+      recencyScore * 0.35 +
+      artistFamiliarity * 0.30 +
+      albumFamiliarity * 0.15 +
+      activityScore * 0.20
+    );
 
     return {
       id: track.id,
       uri: track.uri,
       name: track.name,
-      artist: fullArtist,
-      primaryArtist,
+      artist,
+      primaryArtist: track.artists?.[0]?.name || "",
       album: track.album?.name || "",
       addedAt: item.addedAt,
-      trackPopularity,
-      rawPopularity: trackPopularity,
-      userActivityScore: activityScore,
-      spotifyUrl: track.external_urls?.spotify || "",
-      stableScore: stableHashToScore(`${fullArtist} ${track.name} ${track.id}`)
-    };
-  });
 
-  const popularityStatus = getRealPopularityStatus(raw);
+      basicnessScore: libraryBasicnessScore,
+      scoreSource: "personal library score",
 
-  return raw.map(item => {
-    let basicnessScore;
-    let scoreSource;
+      recencyScore,
+      artistFamiliarity,
+      albumFamiliarity,
+      activityScore,
+      userActivityScore: activityRaw,
 
-    if (popularityStatus.popularityAvailable) {
-      basicnessScore = item.trackPopularity;
-      scoreSource = "spotify popularity";
-    } else {
-      /*
-        Fallback mode:
-        Spotify returned useless popularity values.
+      artistCount,
+      albumCount,
 
-        We still need a stable 0-100 distribution that is not simply
-        "most recently liked." This creates a pseudo-obscurity ranking using:
-        - stable hash of the track
-        - small activity bump for tracks Spotify says you play often
-        - small recency bump
-      */
-      const addedTime = new Date(item.addedAt).getTime() || 0;
-      const now = Date.now();
-      const ageDays = Math.max((now - addedTime) / 86400000, 0);
-      const recencyBoost = Math.max(0, 20 - Math.min(ageDays / 30, 20));
-      const activityBoost = Math.min(item.userActivityScore / 8, 25);
-
-      basicnessScore = Math.round(
-        Math.max(
-          0,
-          Math.min(100, item.stableScore * 0.7 + activityBoost + recencyBoost)
-        )
-      );
-
-      scoreSource = "fallback distribution";
-    }
-
-    return {
-      ...item,
-      basicnessScore,
-      scoreSource
+      spotifyUrl: track.external_urls?.spotify || ""
     };
   });
 }
@@ -447,11 +434,7 @@ function buildTiers(scored) {
       return a.basicnessScore - b.basicnessScore;
     }
 
-    if (b.userActivityScore !== a.userActivityScore) {
-      return b.userActivityScore - a.userActivityScore;
-    }
-
-    return new Date(b.addedAt) - new Date(a.addedAt);
+    return a.name.localeCompare(b.name);
   });
 
   const tiers = [];
@@ -461,17 +444,44 @@ function buildTiers(scored) {
     const end = Math.floor((sortedByBasicness.length / count) * (i + 1));
     const bucket = sortedByBasicness.slice(start, end);
 
-    const topFromBucket = [...bucket]
+    /*
+      Pick the best examples of that tier, not just the first 50.
+      For deep tiers, prefer rarer artists/albums and older saves.
+      For surface tiers, prefer familiar/recent/active tracks.
+    */
+    const isDeepTier = i < count / 2;
+
+    const selected = [...bucket]
       .sort((a, b) => {
-        if (b.userActivityScore !== a.userActivityScore) {
-          return b.userActivityScore - a.userActivityScore;
+        if (isDeepTier) {
+          const aDeep =
+            (100 - a.artistFamiliarity) * 0.4 +
+            (100 - a.albumFamiliarity) * 0.2 +
+            (100 - a.recencyScore) * 0.3 +
+            a.activityScore * 0.1;
+
+          const bDeep =
+            (100 - b.artistFamiliarity) * 0.4 +
+            (100 - b.albumFamiliarity) * 0.2 +
+            (100 - b.recencyScore) * 0.3 +
+            b.activityScore * 0.1;
+
+          return bDeep - aDeep;
         }
 
-        if (b.trackPopularity !== a.trackPopularity) {
-          return b.trackPopularity - a.trackPopularity;
-        }
+        const aSurface =
+          a.artistFamiliarity * 0.3 +
+          a.albumFamiliarity * 0.15 +
+          a.recencyScore * 0.25 +
+          a.activityScore * 0.3;
 
-        return new Date(b.addedAt) - new Date(a.addedAt);
+        const bSurface =
+          b.artistFamiliarity * 0.3 +
+          b.albumFamiliarity * 0.15 +
+          b.recencyScore * 0.25 +
+          b.activityScore * 0.3;
+
+        return bSurface - aSurface;
       })
       .slice(0, tracksPerPlaylist);
 
@@ -483,8 +493,8 @@ function buildTiers(scored) {
         percentileStart: Math.round((i / count) * 100),
         percentileEnd: Math.round(((i + 1) / count) * 100),
         totalInTier: bucket.length,
-        scoreSource: bucket[0]?.scoreSource || "unknown",
-        tracks: topFromBucket
+        scoreSource: "personal library score",
+        tracks: selected
       });
     }
   }
@@ -498,16 +508,11 @@ function renderPreview() {
     return;
   }
 
-  const popularityStatus = getRealPopularityStatus(scoredTracks);
-  const usingFallback = !popularityStatus.popularityAvailable;
-
   els.preview.innerHTML = `
     <p>
       Scored ${scoredTracks.length} liked songs and generated ${generatedTiers.length} tiers.
-      ${usingFallback
-        ? `Spotify returned usable popularity for only ${popularityStatus.nonZero} tracks, so this run used fallback distribution + your top/recent activity.`
-        : `Using Spotify popularity for tier placement, then your top/recent activity to pick the top songs in each tier.`
-      }
+      Spotify popularity is ignored in this version. Tiers are based on your own library:
+      liked-date age, artist frequency, album frequency, and top/recent listening.
     </p>
 
     ${generatedTiers.map(tier => {
@@ -515,8 +520,9 @@ function renderPreview() {
         <li>
           <strong>${escapeHtml(track.artist)}</strong> — ${escapeHtml(track.name)}
           <span class="score">
-            tier ${track.basicnessScore},
-            Spotify pop ${track.trackPopularity},
+            score ${track.basicnessScore},
+            artist x${track.artistCount},
+            album x${track.albumCount},
             activity ${track.userActivityScore}
           </span>
         </li>
@@ -527,7 +533,7 @@ function renderPreview() {
           <div class="tier-header">
             <strong>${escapeHtml(tier.name)}</strong>
             <span class="score">
-              ${tier.percentileStart}-${tier.percentileEnd}% • tier score ${tier.minScore}-${tier.maxScore}
+              ${tier.percentileStart}-${tier.percentileEnd}% • library score ${tier.minScore}-${tier.maxScore}
             </span>
           </div>
           <p class="small">
@@ -556,13 +562,10 @@ async function scanLikedSongs() {
 
   try {
     const likedItems = await getAllLikedTracks();
-
-    const hydratedLikedItems = await hydrateTracks(likedItems);
-
     const topScores = await getUserTopTrackScores();
     const recentScores = await getRecentlyPlayedScores();
 
-    scoredTracks = buildScoredTracks(hydratedLikedItems, topScores, recentScores);
+    scoredTracks = buildScoredTracks(likedItems, topScores, recentScores);
     generatedTiers = buildTiers(scoredTracks);
 
     renderPreview();
@@ -570,12 +573,9 @@ async function scanLikedSongs() {
     els.createBtn.disabled = generatedTiers.length === 0;
     els.icebergBtn.disabled = generatedTiers.length === 0;
 
-    const popularityStatus = getRealPopularityStatus(scoredTracks);
-
     setStatus(
       `Done. Scored ${scoredTracks.length} liked songs. ` +
-      `Generated ${generatedTiers.length} tiers. ` +
-      `Usable Spotify popularity found for ${popularityStatus.nonZero} tracks.`
+      `Generated ${generatedTiers.length} tiers using personal library scoring.`
     );
   } catch (err) {
     setStatus(err.message);
@@ -619,8 +619,8 @@ async function createPlaylists() {
           public: isPublic,
           description:
             `Generated by Before They Were Basic. ` +
-            `Tier ${tier.percentileStart}-${tier.percentileEnd}%. ` +
-            `Tier score ${tier.minScore}-${tier.maxScore}.`
+            `Personal library tier ${tier.percentileStart}-${tier.percentileEnd}%. ` +
+            `Library score ${tier.minScore}-${tier.maxScore}.`
         })
       });
 
@@ -757,7 +757,7 @@ function logout(updateStatus = true) {
   }
 
   if (updateStatus) {
-    setStatus("Login cleared.");
+    setStatus("Logged out.");
   }
 }
 
