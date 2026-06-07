@@ -6,6 +6,7 @@ const SCOPES = [
   "user-read-private",
   "user-library-read",
   "user-top-read",
+  "user-read-recently-played",
   "playlist-modify-private",
   "playlist-modify-public"
 ];
@@ -105,6 +106,7 @@ async function handleOAuthCallback() {
   }
 
   const data = await response.json();
+
   accessToken = data.access_token;
   localStorage.setItem("spotify_access_token", accessToken);
 
@@ -148,14 +150,53 @@ async function loadProfile() {
   setStatus(`Connected as ${userProfile.display_name || userProfile.id}.`);
 }
 
+function chunk(array, size) {
+  const chunks = [];
+
+  for (let i = 0; i < array.length; i += size) {
+    chunks.push(array.slice(i, i + size));
+  }
+
+  return chunks;
+}
+
+function normalizeText(value) {
+  return String(value || "")
+    .toLowerCase()
+    .normalize("NFKD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/[^a-z0-9а-яё一-龯ぁ-んァ-ン가-힣]+/gi, " ")
+    .trim();
+}
+
+function trackKeyFromParts(artist, name) {
+  return `${normalizeText(artist)}::${normalizeText(name)}`;
+}
+
+function trackKey(track) {
+  const artist = track.artists?.[0]?.name || "";
+  return trackKeyFromParts(artist, track.name);
+}
+
+function stableHashToScore(text) {
+  let hash = 2166136261;
+
+  for (let i = 0; i < text.length; i++) {
+    hash ^= text.charCodeAt(i);
+    hash = Math.imul(hash, 16777619);
+  }
+
+  return Math.abs(hash >>> 0) % 100;
+}
+
 async function getAllLikedTracks() {
   let url = "/me/tracks?limit=50";
   const items = [];
 
   while (url) {
     const data = await spotifyFetch(url);
-    items.push(...data.items);
 
+    items.push(...data.items);
     setStatus(`Fetched ${items.length} liked songs...`);
 
     url = data.next
@@ -171,64 +212,198 @@ async function getAllLikedTracks() {
     .filter(item => item.track && item.track.type === "track" && item.track.id);
 }
 
-async function getUserTopTrackScores() {
-  const ranges = [
-    { key: "short_term", weight: 100 },
-    { key: "medium_term", weight: 70 },
-    { key: "long_term", weight: 45 }
-  ];
+async function hydrateTracks(likedItems) {
+  const ids = likedItems.map(item => item.track.id).filter(Boolean);
+  const idChunks = chunk(ids, 50);
+  const hydratedMap = new Map();
 
-  const scoreMap = new Map();
+  for (let i = 0; i < idChunks.length; i++) {
+    const idList = idChunks[i].join(",");
 
-  for (const range of ranges) {
-    const data = await spotifyFetch(
-      `/me/top/tracks?time_range=${range.key}&limit=50&offset=0`
-    );
+    try {
+      const data = await spotifyFetch(`/tracks?ids=${idList}&market=from_token`);
 
-    data.items.forEach((track, index) => {
-      const rankScore = range.weight - index;
-      const existing = scoreMap.get(track.id) || {
-        score: 0,
-        labels: []
-      };
+      for (const track of data.tracks || []) {
+        if (track && track.id) {
+          hydratedMap.set(track.id, track);
+        }
+      }
 
-      existing.score += Math.max(rankScore, 1);
-      existing.labels.push(`${range.key} #${index + 1}`);
-
-      scoreMap.set(track.id, existing);
-    });
-
-    setStatus(`Fetched your ${range.key.replace("_", " ")} top tracks...`);
+      setStatus(`Hydrated track metadata ${i + 1}/${idChunks.length}...`);
+    } catch (err) {
+      console.warn("Track hydration failed:", err);
+      setStatus(
+        `Track metadata hydration failed. Continuing with saved-track data. ${err.message}`
+      );
+      break;
+    }
   }
 
-  return scoreMap;
+  return likedItems.map(item => {
+    const hydrated = hydratedMap.get(item.track.id);
+
+    return {
+      addedAt: item.addedAt,
+      track: hydrated || item.track
+    };
+  });
 }
 
-function buildScoredTracks(likedItems, topTrackScores) {
-  return likedItems.map(item => {
-    const track = item.track;
-    const topData = topTrackScores.get(track.id);
+async function getUserTopTrackScores() {
+  const ranges = [
+    { key: "short_term", weight: 120 },
+    { key: "medium_term", weight: 80 },
+    { key: "long_term", weight: 50 }
+  ];
 
-    const userActivityScore = topData?.score || 0;
+  const scoreById = new Map();
+  const scoreByKey = new Map();
+
+  for (const range of ranges) {
+    try {
+      const data = await spotifyFetch(
+        `/me/top/tracks?time_range=${range.key}&limit=50&offset=0`
+      );
+
+      data.items.forEach((track, index) => {
+        const rankScore = Math.max(range.weight - index, 1);
+        const idExisting = scoreById.get(track.id) || 0;
+        const keyExisting = scoreByKey.get(trackKey(track)) || 0;
+
+        scoreById.set(track.id, idExisting + rankScore);
+        scoreByKey.set(trackKey(track), keyExisting + rankScore);
+      });
+
+      setStatus(`Fetched your ${range.key.replace("_", " ")} top tracks...`);
+    } catch (err) {
+      console.warn("Top tracks failed:", err);
+      setStatus(`Could not fetch ${range.key} top tracks. Continuing...`);
+    }
+  }
+
+  return { scoreById, scoreByKey };
+}
+
+async function getRecentlyPlayedScores() {
+  const scoreById = new Map();
+  const scoreByKey = new Map();
+
+  try {
+    const data = await spotifyFetch("/me/player/recently-played?limit=50");
+
+    data.items.forEach((item, index) => {
+      const track = item.track;
+      if (!track || !track.id) return;
+
+      const score = Math.max(60 - index, 1);
+      const idExisting = scoreById.get(track.id) || 0;
+      const keyExisting = scoreByKey.get(trackKey(track)) || 0;
+
+      scoreById.set(track.id, idExisting + score);
+      scoreByKey.set(trackKey(track), keyExisting + score);
+    });
+
+    setStatus("Fetched your recently played tracks...");
+  } catch (err) {
+    console.warn("Recently played failed:", err);
+    setStatus("Could not fetch recently played tracks. Continuing...");
+  }
+
+  return { scoreById, scoreByKey };
+}
+
+function mergeActivityScore(track, topScores, recentScores) {
+  const key = trackKey(track);
+
+  const topById = topScores.scoreById.get(track.id) || 0;
+  const topByKey = topScores.scoreByKey.get(key) || 0;
+
+  const recentById = recentScores.scoreById.get(track.id) || 0;
+  const recentByKey = recentScores.scoreByKey.get(key) || 0;
+
+  return Math.max(topById, topByKey) + Math.max(recentById, recentByKey);
+}
+
+function getRealPopularityStatus(scored) {
+  const nonZero = scored.filter(t => t.trackPopularity > 0).length;
+  const percentNonZero = scored.length ? nonZero / scored.length : 0;
+
+  return {
+    nonZero,
+    percentNonZero,
+    popularityAvailable: percentNonZero > 0.05
+  };
+}
+
+function buildScoredTracks(likedItems, topScores, recentScores) {
+  const raw = likedItems.map(item => {
+    const track = item.track;
+    const primaryArtist = track.artists?.[0]?.name || "";
+    const fullArtist = track.artists?.map(a => a.name).join(", ") || "";
+
+    const trackPopularity =
+      typeof track.popularity === "number"
+        ? track.popularity
+        : 0;
+
+    const activityScore = mergeActivityScore(track, topScores, recentScores);
 
     return {
       id: track.id,
       uri: track.uri,
       name: track.name,
-      artist: track.artists.map(a => a.name).join(", "),
+      artist: fullArtist,
+      primaryArtist,
       album: track.album?.name || "",
       addedAt: item.addedAt,
-      trackPopularity: track.popularity ?? 0,
+      trackPopularity,
+      rawPopularity: trackPopularity,
+      userActivityScore: activityScore,
+      spotifyUrl: track.external_urls?.spotify || "",
+      stableScore: stableHashToScore(`${fullArtist} ${track.name} ${track.id}`)
+    };
+  });
 
-      // 0 = obscure, 100 = basic
-      basicnessScore: track.popularity ?? 0,
+  const popularityStatus = getRealPopularityStatus(raw);
 
-      // Higher means the user appears to listen to it more.
-      userActivityScore,
+  return raw.map(item => {
+    let basicnessScore;
+    let scoreSource;
 
-      userActivityLabel: topData?.labels?.join(", ") || "not in Spotify top tracks",
+    if (popularityStatus.popularityAvailable) {
+      basicnessScore = item.trackPopularity;
+      scoreSource = "spotify popularity";
+    } else {
+      /*
+        Fallback mode:
+        Spotify returned useless popularity values.
 
-      spotifyUrl: track.external_urls?.spotify || ""
+        We still need a stable 0-100 distribution that is not simply
+        "most recently liked." This creates a pseudo-obscurity ranking using:
+        - stable hash of the track
+        - small activity bump for tracks Spotify says you play often
+        - small recency bump
+      */
+      const addedTime = new Date(item.addedAt).getTime() || 0;
+      const now = Date.now();
+      const ageDays = Math.max((now - addedTime) / 86400000, 0);
+      const recencyBoost = Math.max(0, 20 - Math.min(ageDays / 30, 20));
+      const activityBoost = Math.min(item.userActivityScore / 8, 25);
+
+      basicnessScore = Math.round(
+        Math.max(
+          0,
+          Math.min(100, item.stableScore * 0.7 + activityBoost + recencyBoost)
+        )
+      );
+
+      scoreSource = "fallback distribution";
+    }
+
+    return {
+      ...item,
+      basicnessScore,
+      scoreSource
     };
   });
 }
@@ -292,8 +467,10 @@ function buildTiers(scored) {
           return b.userActivityScore - a.userActivityScore;
         }
 
-        // If Spotify does not expose enough top-track activity,
-        // use most recently liked songs as fallback.
+        if (b.trackPopularity !== a.trackPopularity) {
+          return b.trackPopularity - a.trackPopularity;
+        }
+
         return new Date(b.addedAt) - new Date(a.addedAt);
       })
       .slice(0, tracksPerPlaylist);
@@ -306,6 +483,7 @@ function buildTiers(scored) {
         percentileStart: Math.round((i / count) * 100),
         percentileEnd: Math.round(((i + 1) / count) * 100),
         totalInTier: bucket.length,
+        scoreSource: bucket[0]?.scoreSource || "unknown",
         tracks: topFromBucket
       });
     }
@@ -320,17 +498,26 @@ function renderPreview() {
     return;
   }
 
+  const popularityStatus = getRealPopularityStatus(scoredTracks);
+  const usingFallback = !popularityStatus.popularityAvailable;
+
   els.preview.innerHTML = `
     <p>
       Scored ${scoredTracks.length} liked songs and generated ${generatedTiers.length} tiers.
-      Each tier is sorted by your Spotify top-track activity first, then recently liked tracks.
+      ${usingFallback
+        ? `Spotify returned usable popularity for only ${popularityStatus.nonZero} tracks, so this run used fallback distribution + your top/recent activity.`
+        : `Using Spotify popularity for tier placement, then your top/recent activity to pick the top songs in each tier.`
+      }
     </p>
+
     ${generatedTiers.map(tier => {
       const trackList = tier.tracks.slice(0, 10).map(track => `
         <li>
           <strong>${escapeHtml(track.artist)}</strong> — ${escapeHtml(track.name)}
           <span class="score">
-            popularity ${track.basicnessScore}, activity ${track.userActivityScore}
+            tier ${track.basicnessScore},
+            Spotify pop ${track.trackPopularity},
+            activity ${track.userActivityScore}
           </span>
         </li>
       `).join("");
@@ -340,7 +527,7 @@ function renderPreview() {
           <div class="tier-header">
             <strong>${escapeHtml(tier.name)}</strong>
             <span class="score">
-              ${tier.percentileStart}-${tier.percentileEnd}% • popularity ${tier.minScore}-${tier.maxScore}
+              ${tier.percentileStart}-${tier.percentileEnd}% • tier score ${tier.minScore}-${tier.maxScore}
             </span>
           </div>
           <p class="small">
@@ -369,9 +556,13 @@ async function scanLikedSongs() {
 
   try {
     const likedItems = await getAllLikedTracks();
-    const topTrackScores = await getUserTopTrackScores();
 
-    scoredTracks = buildScoredTracks(likedItems, topTrackScores);
+    const hydratedLikedItems = await hydrateTracks(likedItems);
+
+    const topScores = await getUserTopTrackScores();
+    const recentScores = await getRecentlyPlayedScores();
+
+    scoredTracks = buildScoredTracks(hydratedLikedItems, topScores, recentScores);
     generatedTiers = buildTiers(scoredTracks);
 
     renderPreview();
@@ -379,25 +570,18 @@ async function scanLikedSongs() {
     els.createBtn.disabled = generatedTiers.length === 0;
     els.icebergBtn.disabled = generatedTiers.length === 0;
 
+    const popularityStatus = getRealPopularityStatus(scoredTracks);
+
     setStatus(
       `Done. Scored ${scoredTracks.length} liked songs. ` +
-      `Generated ${generatedTiers.length} tiers using Spotify popularity + your top-track activity.`
+      `Generated ${generatedTiers.length} tiers. ` +
+      `Usable Spotify popularity found for ${popularityStatus.nonZero} tracks.`
     );
   } catch (err) {
     setStatus(err.message);
   } finally {
     els.scanBtn.disabled = false;
   }
-}
-
-function chunk(array, size) {
-  const chunks = [];
-
-  for (let i = 0; i < array.length; i += size) {
-    chunks.push(array.slice(i, i + size));
-  }
-
-  return chunks;
 }
 
 async function addTracksToPlaylist(playlistId, uris) {
@@ -436,7 +620,7 @@ async function createPlaylists() {
           description:
             `Generated by Before They Were Basic. ` +
             `Tier ${tier.percentileStart}-${tier.percentileEnd}%. ` +
-            `Spotify popularity range ${tier.minScore}-${tier.maxScore}.`
+            `Tier score ${tier.minScore}-${tier.maxScore}.`
         })
       });
 
