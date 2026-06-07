@@ -1,0 +1,96 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Before They Were Basic</title>
+  <link rel="stylesheet" href="./styles.css" />
+</head>
+<body>
+  <header class="nav">
+    <a class="brand" href="./index.html">Before They Were Basic</a>
+    <nav>
+      <a href="./about.html">About</a>
+      <a href="./privacy.html">Privacy</a>
+      <a href="./terms.html">Terms</a>
+    </nav>
+  </header>
+
+  <main class="shell">
+    <section class="hero card">
+      <p class="eyebrow">Spotify obscurity playlist generator</p>
+      <h1>Find out how basic your liked songs are.</h1>
+      <p class="lead">Log in with Spotify, scan your liked songs, create playlists from “I Knew Them Before They Were Big” to “Basic Bitch,” and generate your personal music taste iceberg.</p>
+      <div class="actions">
+        <button id="loginBtn">Log in with Spotify</button>
+        <button id="logoutBtn" class="secondary">Clear login</button>
+      </div>
+      <p class="fineprint">Uses Spotify popularity, artist popularity, and artist follower counts. Spotify’s API does not expose exact song play counts.</p>
+    </section>
+
+    <section class="grid">
+      <aside class="card controls">
+        <h2>Settings</h2>
+
+        <label for="tierCount">Number of playlists</label>
+        <select id="tierCount">
+          <option value="3">3</option>
+          <option value="5">5</option>
+          <option value="10" selected>10</option>
+        </select>
+
+        <label for="tracksPerPlaylist">Tracks per playlist</label>
+        <select id="tracksPerPlaylist">
+          <option value="25">25</option>
+          <option value="50" selected>50</option>
+          <option value="100">100</option>
+        </select>
+
+        <label for="visibility">Playlist visibility</label>
+        <select id="visibility">
+          <option value="private" selected>Private</option>
+          <option value="public">Public</option>
+        </select>
+
+        <label for="minTracksPerTier">Minimum tracks required per tier</label>
+        <input id="minTracksPerTier" type="number" min="1" value="5" />
+
+        <label for="playlistPrefix">Playlist prefix</label>
+        <input id="playlistPrefix" value="Before They Were Basic" />
+
+        <label for="playlistNames">Tier names, one per line</label>
+        <textarea id="playlistNames">I Knew Them Before They Were Big
+Basement Show Energy
+Your Friend’s Band
+Deep Cut Certified
+Indie Sleaze Adjacent
+Pitchfork Cousin
+College Radio Core
+Cool But Searchable
+Algorithm Enjoyer
+Basic Bitch</textarea>
+
+        <button id="scanBtn" class="secondary" disabled>Scan liked songs</button>
+        <button id="createBtn" disabled>Create playlists in Spotify</button>
+        <button id="icebergBtn" class="secondary" disabled>Generate iceberg meme</button>
+        <a id="downloadIceberg" class="download hidden" download="before-they-were-basic-iceberg.png">Download iceberg PNG</a>
+
+        <div id="status" class="status">Not connected.</div>
+      </aside>
+
+      <section class="card output">
+        <h2>Your tiers</h2>
+        <div id="summary" class="summary">Log in, scan your liked songs, then your tiers will appear here.</div>
+        <div id="preview"></div>
+        <canvas id="icebergCanvas" width="1200" height="1600" class="hidden"></canvas>
+      </section>
+    </section>
+  </main>
+
+  <footer>
+    <p>Not affiliated with Spotify. Made for people who were unbearable about music before it was cool.</p>
+  </footer>
+
+  <script src="./app.js"></script>
+</body>
+</html>
